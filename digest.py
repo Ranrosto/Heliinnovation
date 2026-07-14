@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+============================================================================
+  Health Innovation Digest Agent  ("סוכן חדשנות הבריאות")
+============================================================================
+Runs inside GitHub Actions (see .github/workflows/health-innovation-digest.yml).
+
+Twin of the "Health & Longevity Digest" agent, re-pointed at the six most
+reputable health-innovation / digital-health / health-tech sites for which we
+verified FULL free access to the latest article.
+
+What it does, once a WEEK on Sunday morning:
+  1. Reads the RSS/Atom feed of each of the six sites.
+  2. Removes any article it has already sent before (state in seen.json).
+  3. Sorts the remaining NEW articles by publish date (newest first).
+  4. Picks the LATEST unseen article from each site (1 per source, up to 6).
+  5. Writes a short, original Hebrew summary of each one (via the Anthropic
+     API, Opus 4.8). Summaries are in Claude's own words + a link back to the
+     source, so nothing copyrighted is reproduced.
+  6. Emails them to you as a single nice HTML digest, via Gmail.
+  7. Saves the links into seen.json so they are never sent again.
+
+The ONLY differences from the longevity digest:
+  - Different source list (the six health-innovation sites).
+  - Weekly instead of biweekly (no even/odd-week gate).
+  - One article per site (MAX_PER_SOURCE=1), i.e. "the latest from each site".
+
+Design goals (unchanged):
+  - Self-contained: no database, no external service except Gmail + the
+    Anthropic API. State lives in seen.json committed back to the repo.
+  - Robust: one broken feed or one bad article never kills the whole run;
+    a hard-coded feed URL that breaks is auto-rediscovered from the homepage.
+  - Legal & clean: we summarise in our own words and always link to the
+    original.
+============================================================================
+"""
+
+import os
+import re
+import sys
+import json
+import ssl
+import time
+import html
+import smtplib
+import datetime as dt
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
+
+import feedparser          # pip install feedparser
+import requests            # pip install requests
+from bs4 import BeautifulSoup  # pip install beautifulsoup4 lxml
+
+# ---------------------------------------------------------------------------
+# 0. CONFIG
+# ---------------------------------------------------------------------------
+
+# How many articles to send each run. Six sites -> up to six cards.
+ARTICLES_PER_RUN = int(os.getenv("ARTICLES_PER_RUN", "6"))
+
+# File that remembers which articles were already sent (relative to repo root).
+SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
+
+# Keep at most this many links in memory so seen.json never grows forever.
+MAX_SEEN = 2000
+
+# Only consider articles published within the last N days. A weekly run needs
+# only ~7, but we keep a buffer so a skipped week (or a slower publisher like
+# Rock Health, which posts every few weeks) is never missed.
+MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "30"))
+
+# The core of this agent: at most ONE article from each site per digest, so the
+# email is exactly "the latest article from each of the six sites". 0 = no limit.
+MAX_PER_SOURCE = int(os.getenv("MAX_PER_SOURCE", "1"))
+
+# Treat the cap above as HARD. If only 4 of the 6 sites published something new
+# this week, send 4 cards rather than padding the digest with a 2nd/3rd article
+# from a prolific site (which would quietly break "the latest from each site").
+# Set to "false" to restore the longevity digest's top-up-by-recency behaviour.
+STRICT_PER_SOURCE = os.getenv("STRICT_PER_SOURCE", "true").lower() != "false"
+
+# If a feed's own text for an article is shorter than this many characters,
+# the agent fetches the article page and extracts the full body, so the
+# summary is based on the WHOLE article rather than a teaser.
+MIN_FULLTEXT_CHARS = int(os.getenv("MIN_FULLTEXT_CHARS", "600"))
+
+# Anthropic model used for the Hebrew summaries.
+# claude-opus-4-8 = the Opus flagship: strongest reasoning, best nuance on
+# technical / scientific text. Override with the ANTHROPIC_MODEL secret if you
+# ever want a cheaper model (e.g. claude-sonnet-4-6).
+# NOTE: Opus 4.8 rejects non-default temperature/top_p/top_k with a 400 error,
+# so this script deliberately does not send them.
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+
+# How many times to retry a failed summary call (429 rate-limit / 529 overloaded
+# / transient 5xx) before giving up and falling back to an excerpt.
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "4"))
+
+# Small pause between summary calls so six back-to-back Opus requests do not
+# trip a rate limit in the first place.
+API_PACING_SECONDS = float(os.getenv("API_PACING_SECONDS", "2"))
+
+# Digest branding (change freely without touching code).
+DIGEST_TITLE = os.getenv("DIGEST_TITLE", "חדשנות בבריאות")
+
+# A normal browser User-Agent. Some sites reject the default python UA.
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# --- The curated source list ------------------------------------------------
+# The six health-innovation sites from the access-verified table, each one a
+# site we confirmed gives FULL free access to its latest article.
+# Each entry: display name, primary feed URL, and the homepage used as a
+# fallback for auto-discovering the feed if the primary URL ever breaks.
+FEEDS = [
+    {"name": "Fierce Healthcare",
+     "feed": "https://www.fiercehealthcare.com/rss/xml",
+     "home": "https://www.fiercehealthcare.com/health-tech"},
+
+    {"name": "MobiHealthNews",
+     "feed": "https://www.mobihealthnews.com/feed",
+     "home": "https://www.mobihealthnews.com/news"},
+
+    {"name": "MedCity News",
+     "feed": "https://medcitynews.com/feed",
+     "home": "https://medcitynews.com/"},
+
+    {"name": "npj Digital Medicine",
+     "feed": "https://www.nature.com/npjdigitalmed.rss",
+     "home": "https://www.nature.com/npjdigitalmed/"},
+
+    {"name": "Healthcare IT News",
+     "feed": "https://www.healthcareitnews.com/feed",
+     "home": "https://www.healthcareitnews.com/news"},
+
+    # Rock Health publishes research/insights every few weeks rather than
+    # daily, so most weeks it simply returns nothing new and is skipped -
+    # that is expected and harmless.
+    {"name": "Rock Health",
+     "feed": "https://rockhealth.com/feed/",
+     "home": "https://rockhealth.com/insights/"},
+]
+
+
+# ---------------------------------------------------------------------------
+# 1. SMALL HELPERS
+# ---------------------------------------------------------------------------
+
+def log(msg):
+    """Timestamped log line, visible in the Actions tab."""
+    print(f"[{dt.datetime.now(dt.timezone.utc).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def env(name, required=True, default=None):
+    val = os.getenv(name, default)
+    if required and not val:
+        log(f"FATAL: missing required environment variable/secret: {name}")
+        sys.exit(1)
+    return val
+
+
+def normalize_link(url):
+    """Strip tracking junk so the same article is recognised across runs."""
+    if not url:
+        return ""
+    url = url.split("#")[0]
+    url = re.sub(r"([?&])(utm_[^=]+|fbclid|gclid|mc_cid|mc_eid)=[^&]*", r"\1", url)
+    url = re.sub(r"[?&]+$", "", url)
+    return url.strip().rstrip("/")
+
+
+def load_seen():
+    """Return a set of links already sent. Tolerates a missing/broken file."""
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):          # supports {"links": [...]}
+            data = data.get("links", [])
+        return list(dict.fromkeys(data))    # de-dupe, keep order
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def load_watermarks():
+    """Newest article timestamp already SENT, per source.
+
+    Guards against going backwards in time: without this, a site that
+    publishes nothing new (e.g. Rock Health, every few weeks) would have its
+    next-newest *older* unseen article picked up the following week, so you
+    would receive an older report a week after the newer one. Tolerates the
+    old seen.json format, which has no 'watermarks' key.
+    """
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for src, iso in (data.get("watermarks") or {}).items():
+            try:
+                out[src] = dt.datetime.fromisoformat(iso)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_seen(seen_list, watermarks=None):
+    """Persist the seen links (newest last, capped at MAX_SEEN) + watermarks."""
+    trimmed = seen_list[-MAX_SEEN:]
+    marks = {src: t.isoformat() for src, t in (watermarks or {}).items()}
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"links": trimmed,
+                   "watermarks": marks,
+                   "updated": dt.datetime.now(dt.timezone.utc).isoformat()},
+                  f, ensure_ascii=False, indent=2)
+
+
+def entry_datetime(entry):
+    """Best-effort published/updated time as an aware UTC datetime."""
+    for key in ("published_parsed", "updated_parsed"):
+        t = entry.get(key)
+        if t:
+            return dt.datetime.fromtimestamp(time.mktime(t), tz=dt.timezone.utc)
+    # Unknown date -> treat as "now" so it is not wrongly dropped.
+    return dt.datetime.now(tz=dt.timezone.utc)
+
+
+def clean_text(raw_html, limit=6000):
+    """Turn feed HTML into plain text for the summariser."""
+    if not raw_html:
+        return ""
+    soup = BeautifulSoup(raw_html, "lxml")
+    for tag in soup(["script", "style", "figure", "img", "aside"]):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+    return text[:limit]
+
+
+# ---------------------------------------------------------------------------
+# 2. FEED FETCHING (with auto-discovery fallback)
+# ---------------------------------------------------------------------------
+
+def http_get(url, timeout=30, tries=3):
+    """GET with a real UA and a small backoff, so one transient error
+    (a 503, a slow TLS handshake) does not silently drop a source."""
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml;"
+                  "q=0.9, text/html;q=0.8, */*;q=0.5",
+    }
+    last = None
+    for i in range(tries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(1.5 * (i + 1))
+    raise last
+
+
+def fetch_full_text(url, limit=6000):
+    """Fetch an article page and extract its main body text.
+
+    Used only when a feed gives just a short teaser, so the Hebrew summary
+    is based on the FULL article. Best-effort: returns "" on any failure.
+    """
+    try:
+        resp = http_get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "lxml")
+        for tag in soup(["script", "style", "nav", "header", "footer",
+                         "aside", "form", "figure", "img", "noscript"]):
+            tag.decompose()
+        # Prefer semantic containers; fall back to the whole body.
+        node = soup.find("article") or soup.find("main") or soup.body or soup
+        text = re.sub(r"\s+", " ", node.get_text(" ", strip=True))
+        return text[:limit]
+    except Exception as e:
+        log(f"    full-text fetch failed for {url}: {e}")
+        return ""
+
+
+def discover_feed(home_url):
+    """If a hard-coded feed URL fails, find the real one from the homepage.
+
+    Prefers the main feed and deliberately skips WordPress 'comments' feeds,
+    which are also advertised via <link rel=alternate> on many of these sites.
+    """
+    from urllib.parse import urljoin
+    try:
+        r = http_get(home_url, timeout=25)
+        soup = BeautifulSoup(r.text, "lxml")
+        links = soup.find_all("link", attrs={"type": re.compile(r"rss|atom")})
+        hrefs = [l.get("href") for l in links if l.get("href")]
+        # First choice: a feed URL that is NOT a comments feed.
+        for href in hrefs:
+            if "comment" not in href.lower():
+                return urljoin(home_url, href)
+        # Fallback: whatever feed we found.
+        if hrefs:
+            return urljoin(home_url, hrefs[0])
+    except Exception as e:
+        log(f"    auto-discovery failed for {home_url}: {e}")
+    return None
+
+
+def _parse_feed(url):
+    """Fetch a feed with requests (robust: gzip, redirects, real UA, retry)
+    then hand the raw bytes to feedparser, which detects encoding itself."""
+    resp = http_get(url, timeout=30)
+    return feedparser.parse(resp.content)
+
+
+def fetch_feed(source):
+    """Return a list of normalised article dicts for one source."""
+    articles = []
+
+    # Try the configured feed URL; if it yields nothing, auto-discover.
+    parsed = None
+    for url in (source["feed"], "DISCOVER"):
+        if url == "DISCOVER":
+            url = discover_feed(source["home"])
+            if not url:
+                break
+            log(f"    retrying with discovered feed: {url}")
+        try:
+            candidate = _parse_feed(url)
+        except Exception as e:
+            log(f"    error fetching {url}: {e}")
+            continue
+        if candidate.entries:
+            parsed = candidate
+            break
+
+    if not parsed or not parsed.entries:
+        log(f"  {source['name']}: 0 items (feed unavailable)")
+        return articles
+
+    for e in parsed.entries:
+        link = normalize_link(e.get("link", ""))
+        if not link:
+            continue
+        # Prefer the full <content:encoded>, then summary/description.
+        body = ""
+        if e.get("content"):
+            body = e["content"][0].get("value", "")
+        body = body or e.get("summary", "") or e.get("description", "")
+        articles.append({
+            "source": source["name"],
+            "title": html.unescape((e.get("title") or "").strip()),
+            "link": link,
+            "when": entry_datetime(e),
+            "text": clean_text(body),
+        })
+
+    log(f"  {source['name']}: {len(articles)} items")
+    return articles
+
+
+def _norm_title(t):
+    """Lowercased, punctuation-stripped title for cross-source dedup.
+    Keeps Hebrew (U+0590-05FF) and alphanumerics only."""
+    return re.sub(r"[^a-z0-9\u0590-\u05ff]+", " ", (t or "").lower()).strip()
+
+
+def gather_candidates():
+    """All fresh, unseen articles across every source, newest first."""
+    seen = set(load_seen())
+    marks = load_watermarks()
+    cutoff = dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(days=MAX_AGE_DAYS)
+
+    pool = []
+    empty_sources = []
+    stale_skipped = 0
+    for source in FEEDS:
+        got = fetch_feed(source)
+        if not got:
+            empty_sources.append(source["name"])
+        mark = marks.get(source["name"])
+        for art in got:
+            if art["link"] in seen:
+                continue
+            if art["when"] < cutoff:
+                continue
+            # Never go backwards: skip anything not newer than the newest
+            # article we already sent from this same source.
+            if mark and art["when"] <= mark:
+                stale_skipped += 1
+                continue
+            pool.append(art)
+
+    if stale_skipped:
+        log(f"Skipped {stale_skipped} article(s) older than what was already "
+            f"sent from their source (no going backwards).")
+
+    # De-dupe by link (keep newest), then by normalised title across sources
+    # (so the same wire story on two sites is not sent twice).
+    by_link = {}
+    for art in sorted(pool, key=lambda a: a["when"]):
+        by_link[art["link"]] = art
+
+    ordered, seen_titles = [], set()
+    for art in sorted(by_link.values(), key=lambda a: a["when"], reverse=True):
+        key = _norm_title(art["title"])
+        if key and key in seen_titles:
+            continue
+        seen_titles.add(key)
+        ordered.append(art)
+
+    log(f"Total fresh & unseen candidates: {len(ordered)}")
+    if empty_sources:
+        log(f"Sources returning nothing this run: {', '.join(empty_sources)}")
+    return ordered
+
+
+def select_articles(candidates, n, max_per_source):
+    """Pick up to n articles, newest first, honouring the per-source cap.
+
+    IMPORTANT (differs from the longevity digest on purpose):
+    the whole point of this agent is "the LATEST article from each site", so
+    the per-source cap is HARD. If only 4 of the 6 sites published something
+    new this week, we send 4 cards - we do NOT pad the digest with a second or
+    third article from a prolific site, which would silently break the
+    one-per-site promise. Set STRICT_PER_SOURCE=false to restore the old
+    top-up behaviour (fill empty slots by recency, ignoring the cap).
+    """
+    # gather_candidates() already sorts newest-first, but sort defensively so
+    # this function is correct no matter who calls it.
+    candidates = sorted(candidates, key=lambda a: a["when"], reverse=True)
+
+    chosen, per = [], {}
+    for art in candidates:
+        if max_per_source and per.get(art["source"], 0) >= max_per_source:
+            continue
+        chosen.append(art)
+        per[art["source"]] = per.get(art["source"], 0) + 1
+        if len(chosen) >= n:
+            return chosen
+
+    if STRICT_PER_SOURCE:
+        log(f"Only {len(chosen)} site(s) had a new article; sending those "
+            f"(strict one-per-site).")
+        return chosen
+
+    # Legacy behaviour: fill remaining slots by recency, ignoring the cap.
+    picked = {id(a) for a in chosen}
+    for art in candidates:
+        if id(art) not in picked:
+            chosen.append(art)
+            picked.add(id(art))
+            if len(chosen) >= n:
+                break
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# 3. HEBREW SUMMARY (Anthropic API, Opus 4.8)
+# ---------------------------------------------------------------------------
+
+def summarize_he(article, api_key):
+    """
+    Original Hebrew summary in Claude's own words. No long verbatim quotes,
+    so nothing copyrighted is reproduced - we always link to the source.
+    Falls back to a short trimmed excerpt if the API call fails.
+    """
+    text = article["text"] or article["title"]
+    prompt = (
+        "לפניך כתבה בתחום חדשנות הבריאות / דיגיטל-הלת' / טכנולוגיה רפואית. "
+        "כתוב סיכום קצר בעברית, במילים שלך בלבד (בלי ציטוטים ארוכים), 3-5 משפטים, "
+        "בשפה נגישה ומדויקת. הסבר כל מונח טכני או קיצור בסוגריים. "
+        "הימנע מהגזמות שיווקיות ומקביעות סיבתיות שאין להן ביסוס. "
+        "בשורה נפרדת בסוף, הוסף שורה אחת שמתחילה ב'למה זה חשוב:' עם המסקנה המעשית.\n\n"
+        f"כותרת: {article['title']}\n\n"
+        f"תוכן:\n{text}"
+    )
+    # Retry on transient failures. A single 429 (rate limit - plausible when we
+    # fire six requests back to back) or 529 (model overloaded - common) must
+    # NOT silently downgrade the digest to an English excerpt.
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 700,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=90,
+            )
+
+            # 429 / 5xx are worth retrying; 4xx (bad key, bad model) are not.
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt < API_MAX_RETRIES:
+                    # Honour Retry-After when the API sends it.
+                    wait = float(r.headers.get("retry-after") or 0) or (2 ** attempt)
+                    log(f"    API {r.status_code} (attempt {attempt}/{API_MAX_RETRIES}); "
+                        f"retrying in {wait:.0f}s")
+                    time.sleep(wait)
+                    continue
+
+            r.raise_for_status()
+            data = r.json()
+            parts = [b.get("text", "") for b in data.get("content", [])
+                     if b.get("type") == "text"]
+            summary = "\n".join(p for p in parts if p).strip()
+            if summary:
+                return summary
+            log(f"    API returned an empty summary (attempt {attempt}).")
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            # 4xx (except 429, handled above) is permanent: a bad API key, a
+            # wrong model name, a malformed request. Retrying cannot help, and
+            # burning four retries per article would waste ~90s for nothing.
+            if 400 <= code < 500:
+                log(f"    PERMANENT API error {code} for "
+                    f"'{article['title'][:40]}': {e}. Not retrying. "
+                    f"Check ANTHROPIC_API_KEY / ANTHROPIC_MODEL.")
+                break
+            log(f"    summary API failed for '{article['title'][:40]}' "
+                f"(attempt {attempt}/{API_MAX_RETRIES}): {e}")
+            if attempt < API_MAX_RETRIES:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            log(f"    summary API failed for '{article['title'][:40]}' "
+                f"(attempt {attempt}/{API_MAX_RETRIES}): {e}")
+            if attempt < API_MAX_RETRIES:
+                time.sleep(2 ** attempt)
+
+    # Every attempt failed. Fall back to a short excerpt, clearly marked so a
+    # degraded card is obvious in the email rather than looking like a summary.
+    log(f"    !! giving up on summary for '{article['title'][:40]}' - "
+        f"sending excerpt fallback.")
+    excerpt = (article["text"] or "")[:280].strip()
+    return (f"(תקציר מהמקור; הסיכום האוטומטי נכשל)\n{excerpt} …"
+            if excerpt else "(לא הופק סיכום; ראה קישור למקור)")
+
+
+# ---------------------------------------------------------------------------
+# 4. EMAIL
+# ---------------------------------------------------------------------------
+
+def build_email_html(items, run_date):
+    """A clean, RTL, mobile-friendly HTML digest."""
+    cards = []
+    for i, it in enumerate(items, 1):
+        summary_html = html.escape(it["summary"]).replace("\n", "<br>")
+        cards.append(f"""
+        <div style="background:#ffffff;border:1px solid #ece7df;border-radius:14px;
+                    padding:20px 22px;margin:0 0 18px 0;">
+          <div style="font-size:13px;color:#B8925A;font-weight:700;
+                      letter-spacing:.2px;margin-bottom:6px;">
+            {i}. {html.escape(it['source'])}
+            &nbsp;·&nbsp;{it['when'].strftime('%d.%m.%Y')}
+          </div>
+          <div style="font-size:18px;font-weight:800;line-height:1.4;
+                      color:#1c1a17;margin-bottom:10px;">
+            {html.escape(it['title'])}
+          </div>
+          <div style="font-size:15px;line-height:1.75;color:#3a352f;">
+            {summary_html}
+          </div>
+          <a href="{html.escape(it['link'])}"
+             style="display:inline-block;margin-top:14px;font-size:14px;
+                    font-weight:700;color:#B8925A;text-decoration:none;">
+            קריאת הכתבה המלאה ←
+          </a>
+        </div>""")
+
+    return f"""<!DOCTYPE html>
+<html dir="rtl" lang="he"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:24px 12px;background:#14110E;
+             font-family:'Segoe UI',Arial,Helvetica,sans-serif;">
+  <div style="max-width:640px;margin:0 auto;">
+    <div style="text-align:center;padding:8px 0 22px 0;">
+      <div style="font-size:24px;font-weight:800;color:#E6A23C;">
+        {html.escape(DIGEST_TITLE)}
+      </div>
+      <div style="font-size:13px;color:#9a9186;margin-top:6px;">
+        מקבץ שבועי · {run_date.strftime('%d.%m.%Y')} · {len(items)} כתבות
+      </div>
+    </div>
+    {''.join(cards)}
+    <div style="text-align:center;color:#6f675d;font-size:12px;
+                padding:14px 0 4px 0;">
+      נאסף אוטומטית מאתרי חדשנות בריאות ודיגיטל-הלת' מובילים.
+      כל סיכום מנוסח מחדש ומקושר למקור.
+    </div>
+  </div>
+</body></html>"""
+
+
+def build_email_text(items, run_date):
+    """A readable plain-text version (accessibility + if HTML is blocked)."""
+    lines = [f"{DIGEST_TITLE} · {run_date.strftime('%d.%m.%Y')} · "
+             f"{len(items)} כתבות", ""]
+    for i, it in enumerate(items, 1):
+        lines += [
+            f"{i}. [{it['source']} · {it['when'].strftime('%d.%m.%Y')}]",
+            it["title"],
+            it["summary"],
+            it["link"],
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def send_email(html_body, text_body, subject, gmail_addr, gmail_pass, recipient):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("Health Innovation Digest", gmail_addr))
+    msg["To"] = recipient
+    # Order matters: plain first, HTML second (clients pick the last they can show).
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+        server.login(gmail_addr, gmail_pass)
+        server.sendmail(gmail_addr, [recipient], msg.as_string())
+    log(f"Email sent to {recipient}")
+
+
+# ---------------------------------------------------------------------------
+# 5. MAIN  (weekly - no biweekly gate; the workflow fires every Sunday)
+# ---------------------------------------------------------------------------
+
+def main():
+    gmail_addr = env("GMAIL_ADDRESS")
+    gmail_pass = env("GMAIL_APP_PASSWORD")
+    # NOTE: the workflow always sets RECIPIENT (to "" when the secret is
+    # undefined), so `getenv(..., default)` would return "" not the default.
+    # `or` correctly falls back to the Gmail address when it is blank.
+    recipient  = os.getenv("RECIPIENT") or gmail_addr
+    api_key    = env("ANTHROPIC_API_KEY")
+
+    log("Gathering candidate articles...")
+    candidates = gather_candidates()
+    if not candidates:
+        log("No new articles this run. Nothing to send. Exiting.")
+        return
+
+    chosen = select_articles(candidates, ARTICLES_PER_RUN, MAX_PER_SOURCE)
+    log(f"Selected {len(chosen)} articles. Enriching + summarising...")
+
+    degraded = 0
+    for idx, it in enumerate(chosen):
+        # If the feed gave only a teaser, fetch the full article body first,
+        # so the summary reflects the WHOLE article (the core requirement).
+        if len(it["text"]) < MIN_FULLTEXT_CHARS:
+            full = fetch_full_text(it["link"])
+            if len(full) > len(it["text"]):
+                it["text"] = full
+
+        # Space out the Opus calls so six in a row do not trip a rate limit.
+        if idx > 0 and API_PACING_SECONDS:
+            time.sleep(API_PACING_SECONDS)
+
+        it["summary"] = summarize_he(it, api_key)
+        if it["summary"].startswith("(תקציר מהמקור") or \
+           it["summary"].startswith("(לא הופק סיכום"):
+            degraded += 1
+        log(f"  ✓ {it['source']}: {it['title'][:60]}")
+
+    if degraded:
+        log(f"WARNING: {degraded}/{len(chosen)} summaries fell back to an excerpt "
+            f"(API trouble). The digest is still being sent.")
+
+    run_date = dt.date.today()
+    subject = f"{DIGEST_TITLE} · {run_date.strftime('%d.%m.%Y')} · {len(chosen)} כתבות"
+    html_body = build_email_html(chosen, run_date)
+    text_body = build_email_text(chosen, run_date)
+
+    # Send FIRST. Only if the email succeeds do we mark articles as seen,
+    # so a failure never silently 'burns' articles.
+    send_email(html_body, text_body, subject, gmail_addr, gmail_pass, recipient)
+
+    seen = load_seen()
+    seen.extend(it["link"] for it in chosen)
+    seen = list(dict.fromkeys(seen))
+
+    # Advance the per-source watermark to the newest article we just sent.
+    marks = load_watermarks()
+    for it in chosen:
+        cur = marks.get(it["source"])
+        if cur is None or it["when"] > cur:
+            marks[it["source"]] = it["when"]
+
+    save_seen(seen, marks)
+    log(f"Updated {SEEN_FILE} (+{len(chosen)} links, "
+        f"{len(marks)} source watermarks, total {len(seen)}).")
+    log("Done.")
+
+
+if __name__ == "__main__":
+    main()
