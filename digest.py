@@ -53,6 +53,20 @@ import feedparser          # pip install feedparser
 import requests            # pip install requests
 from bs4 import BeautifulSoup  # pip install beautifulsoup4 lxml
 
+# curl_cffi impersonates a real Chrome browser at the TLS level. Several of our
+# sources (MobiHealthNews, MedCity News, Healthcare IT News, Rock Health) sit
+# behind bot protection that returns 403 to python-requests no matter which
+# User-Agent string we send, because it fingerprints the TLS handshake itself.
+# curl_cffi makes the request look like genuine Chrome, which passes most of
+# these checks. If it is not installed we fall back to plain requests, so the
+# script never crashes over it - some sources just come back 403 again.
+try:
+    from curl_cffi import requests as browser_requests  # pip install curl_cffi
+    HAVE_BROWSER_TLS = True
+except ImportError:
+    browser_requests = None
+    HAVE_BROWSER_TLS = False
+
 # ---------------------------------------------------------------------------
 # 0. CONFIG
 # ---------------------------------------------------------------------------
@@ -246,21 +260,42 @@ def clean_text(raw_html, limit=6000):
 # ---------------------------------------------------------------------------
 
 def http_get(url, timeout=30, tries=3):
-    """GET with a real UA and a small backoff, so one transient error
-    (a 503, a slow TLS handshake) does not silently drop a source."""
+    """GET that looks like a real Chrome browser, with a small backoff.
+
+    Why: 4 of our 6 sources reject python-requests with 403 (bot protection
+    that fingerprints the TLS handshake, not just the User-Agent). So the
+    FIRST choice is curl_cffi with Chrome impersonation; plain requests is
+    only a fallback when curl_cffi is not installed. The retry loop keeps a
+    transient error (a 503, a slow handshake) from silently dropping a source.
+    """
     headers = {
-        "User-Agent": UA,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;"
                   "q=0.9, text/html;q=0.8, */*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     last = None
     for i in range(tries):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            if HAVE_BROWSER_TLS:
+                # impersonate="chrome" sends real Chrome headers + TLS
+                # fingerprint; do NOT also send our fake UA on top of it.
+                resp = browser_requests.get(
+                    url, headers=headers, timeout=timeout,
+                    impersonate="chrome", allow_redirects=True)
+            else:
+                resp = requests.get(
+                    url, headers={**headers, "User-Agent": UA}, timeout=timeout)
             resp.raise_for_status()
             return resp
         except Exception as e:
             last = e
+            # A 403 is a deliberate block, not a hiccup - retrying the exact
+            # same request just wastes ~5s per source. Fail fast; the caller
+            # logs it and skips the source for this run (per policy: a blocked
+            # site is simply skipped, no scraping workarounds).
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                break
             if i < tries - 1:
                 time.sleep(1.5 * (i + 1))
     raise last
@@ -352,9 +387,12 @@ def fetch_feed(source):
         if e.get("content"):
             body = e["content"][0].get("value", "")
         body = body or e.get("summary", "") or e.get("description", "")
+        # Titles arrive from some feeds with raw HTML inside (Fierce Healthcare
+        # once shipped a full <a href=...> tag as the title), so titles go
+        # through the same tag-stripping as bodies - never trust feed HTML.
         articles.append({
             "source": source["name"],
-            "title": html.unescape((e.get("title") or "").strip()),
+            "title": clean_text(e.get("title") or "", limit=300),
             "link": link,
             "when": entry_datetime(e),
             "text": clean_text(body),
@@ -471,12 +509,25 @@ def summarize_he(article, api_key):
     Falls back to a short trimmed excerpt if the API call fails.
     """
     text = article["text"] or article["title"]
+    # The summary style is modelled on a good Hebrew LinkedIn post: accessible,
+    # precise, warm, zero jargon, zero marketing fluff. A FIXED three-part
+    # structure ("מה קרה / הסבר / למה זה חשוב") makes every card in the email
+    # scannable in seconds and lets the HTML layer bold the right lines.
     prompt = (
-        "לפניך כתבה בתחום חדשנות הבריאות / דיגיטל-הלת' / טכנולוגיה רפואית. "
-        "כתוב סיכום קצר בעברית, במילים שלך בלבד (בלי ציטוטים ארוכים), 3-5 משפטים, "
-        "בשפה נגישה ומדויקת. הסבר כל מונח טכני או קיצור בסוגריים. "
-        "הימנע מהגזמות שיווקיות ומקביעות סיבתיות שאין להן ביסוס. "
-        "בשורה נפרדת בסוף, הוסף שורה אחת שמתחילה ב'למה זה חשוב:' עם המסקנה המעשית.\n\n"
+        "אתה כותב סיכום לדייג'סט אישי בעברית על חדשנות בבריאות, "
+        "בטון של פוסט לינקדאין טוב: נגיש, מדויק, אנושי, בגובה העיניים. "
+        "דמיין שאתה מסביר את הכתבה לחבר סקרן ואינטליגנטי שאינו מהתחום.\n\n"
+        "מבנה מחייב, בדיוק שלושה חלקים:\n"
+        "1. שורה שמתחילה ב'מה קרה:' - משפט אחד פשוט שמסכם את החדשה, בלי שום מונח טכני.\n"
+        "2. פסקה של 2-3 משפטים קצרים שמסבירה את הסיפור בשפה יומיומית. "
+        "כל מונח מקצועי, קיצור או שם טכנולוגיה - הסבר מיד בסוגריים במילים פשוטות. "
+        "אם יש מספר או ממצא מרכזי, ציין אותו בפשטות.\n"
+        "3. שורה שמתחילה ב'למה זה חשוב:' - משפט אחד עם ההשלכה המעשית "
+        "(למטופלים, לרופאים, למערכת הבריאות או לתעשייה).\n\n"
+        "כללים: במילים שלך בלבד, בלי ציטוטים ארוכים. בלי סופרלטיבים שיווקיים "
+        "('פורץ דרך', 'מהפכני'). בלי קביעות סיבתיות שאין להן ביסוס בכתבה. "
+        "אם הכתבה מתארת מחקר, אמור באיזה סוג מחקר מדובר ומה מגבלותיו במשפט קצר. "
+        "משפטים קצרים. עברית טבעית, לא מתורגמת.\n\n"
         f"כותרת: {article['title']}\n\n"
         f"תוכן:\n{text}"
     )
@@ -551,11 +602,45 @@ def summarize_he(article, api_key):
 # 4. EMAIL
 # ---------------------------------------------------------------------------
 
+def summary_to_html(summary):
+    """Turn the structured summary into scannable HTML.
+
+    The prompt guarantees lines starting with 'מה קרה:' and 'למה זה חשוב:'.
+    'מה קרה' gets a bold label; 'למה זה חשוב' gets its own highlighted box so
+    the practical takeaway jumps out even when skimming on a phone. Any line
+    that does not match (e.g. an excerpt fallback) renders as plain text, so
+    nothing ever breaks.
+    """
+    blocks = []
+    for line in (summary or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        esc = html.escape(line)
+        if line.startswith("למה זה חשוב:"):
+            body = html.escape(line[len("למה זה חשוב:"):].strip())
+            blocks.append(
+                '<div style="margin-top:12px;padding:10px 14px;'
+                'background:#FBF4E7;border-right:3px solid #E6A23C;'
+                'border-radius:8px;font-size:14.5px;line-height:1.7;color:#3a352f;">'
+                '<span style="font-weight:800;color:#B8925A;">למה זה חשוב: </span>'
+                f'{body}</div>')
+        elif line.startswith("מה קרה:"):
+            body = html.escape(line[len("מה קרה:"):].strip())
+            blocks.append(
+                '<div style="margin-bottom:8px;">'
+                '<span style="font-weight:800;">מה קרה: </span>'
+                f'{body}</div>')
+        else:
+            blocks.append(f"<div>{esc}</div>")
+    return "\n".join(blocks)
+
+
 def build_email_html(items, run_date):
     """A clean, RTL, mobile-friendly HTML digest."""
     cards = []
     for i, it in enumerate(items, 1):
-        summary_html = html.escape(it["summary"]).replace("\n", "<br>")
+        summary_html = summary_to_html(it["summary"])
         cards.append(f"""
         <div style="background:#ffffff;border:1px solid #ece7df;border-radius:14px;
                     padding:20px 22px;margin:0 0 18px 0;">
